@@ -27,6 +27,7 @@ class App(EWrapper, EClient):
         self._next_req_id = 1
         self.tz = pytz.timezone("US/Eastern")
         self.indices = ["SPX", "NDX", "DJI"]
+        self.max_retry_depth = 3
 
         # Store data wrapper received by request id
         self.data_end_flag = False
@@ -148,12 +149,23 @@ class App(EWrapper, EClient):
             gamma = tick[6]
             vega = tick[7]
             theta = tick[8]
+            underlying_price = tick[9]
+            timestamp = tick[10]
         except Exception:
             print(f"Error trying to parse tick: {tick}")
             print(traceback.format_exc())
             return None
 
-        return {"iv": iv, "delta": delta, "price": price, "gamma": gamma, "vega": vega, "theta": theta}
+        return {
+            "iv": iv,
+            "delta": delta,
+            "price": price,
+            "gamma": gamma,
+            "vega": vega,
+            "theta": theta,
+            "underlying_price": underlying_price,
+            "timestamp": timestamp,
+        }
 
     def greeks(self, option_contracts: List[Contract], allow_cached=False):
         greeks = [None] * len(option_contracts)
@@ -192,7 +204,8 @@ class App(EWrapper, EClient):
 
         return greeks
 
-    def open_interests(self, contracts: List[Contract]):
+    def open_interests(self, contracts: List[Contract], retry_depth=0):
+        """Returns OIs correspond to given contracts of same index."""
         open_interests = []
         start_time = time.time()
         self.reqMarketDataType(self.MarketDataTypes.LIVE)
@@ -221,10 +234,10 @@ class App(EWrapper, EClient):
             open_interests.append(oi)
 
         # Retry indefinitely until all open interests are received
-        if None in open_interests:
+        if None in open_interests and retry_depth < self.max_retry_depth:
             print(f"Retrying {open_interests.count(None)} missing open interests")
             retry_contracts = [contract for contract, oi in zip(contracts, open_interests) if oi is None]
-            retry_open_interests = self.open_interests(retry_contracts)
+            retry_open_interests = self.open_interests(retry_contracts, retry_depth + 1)
 
             for retry_oi in retry_open_interests:
                 for i in range(len(open_interests)):
@@ -428,7 +441,7 @@ class App(EWrapper, EClient):
 
         spot_price = self.historical_data[req_id][0].close
         dt = datetime.strptime(self.historical_data[req_id][0].date, "%Y%m%d %H:%M:%S US/Central")
-        return spot_price, dt + timedelta(minutes=1)
+        return spot_price, dt + timedelta(hours=1, minutes=1)  # Convert to US/Eastern
 
     ##
     ## WRAPPER (METHODS RUN IN MESSAGE LOOP THREAD)
@@ -477,7 +490,7 @@ class App(EWrapper, EClient):
         if tick_type not in self.ticks:
             self.ticks[tick_type] = {}
 
-        self.ticks[tick_type][reqId] = args
+        self.ticks[tick_type][reqId] = (*args, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     def tickSize(self, reqId, tickType, size):
         if tickType not in self.tick_sizes:

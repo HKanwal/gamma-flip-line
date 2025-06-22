@@ -11,92 +11,127 @@ import lib.web_apis as web_apis
 
 # Must not have dividends and must have European style contracts for BS model to be accurate
 SYMBOL = "SPX"
+# Options with open interest above cutoff will not be considered
+OI_CUTOFF = 100
 
 total_runtime_start = time.time()
 app = ibkr.App()
 app.connect()
 
-# Collect expirations
-expirations = app.option_expirations(SYMBOL)
-monthly_expirations = expirations[SYMBOL]
-weekly_expirations = [exp for exp in expirations[f"{SYMBOL}W"] if exp not in monthly_expirations]
-sample_expirations = [
-    weekly_expirations[0],
-    weekly_expirations[1],
-    monthly_expirations[0],
-    monthly_expirations[1],
-]
-sample_expirations.sort(key=lambda exp: datetime.strptime(exp, "%Y%m%d"))
-print("Sampling expirations:", sample_expirations)
-
-# Collect options contracts
-contracts: list[ibkr.Contract] = app.option_contracts(SYMBOL, sample_expirations)
-
-# # Get spot price and spot datetime
-spot_price, dt = app.spot_price(SYMBOL)
+spot_price = app.spot_price(SYMBOL)[0]
 print(f"Using spot price of {spot_price}")
 
-# Collect open interests and IVs (greeks)
-n_downside_strikes = 300
-n_upside_strikes = 100
-# n_downside_strikes = n_upside_strikes = 10  # For testing purposes only
-contracts = list(filter(lambda c: c.tradingClass in [SYMBOL, f"{SYMBOL}W"], contracts))
-strikes = sorted(list(set([c.strike for c in contracts])))
-strikes = (
-    list(filter(lambda strike: strike < spot_price, strikes))[-n_downside_strikes:]
-    + list(filter(lambda strike: strike > spot_price, strikes))[:n_upside_strikes]
-)
-contracts = [contract for contract in contracts if contract.strike in strikes]
-strike_range = (strikes[0], strikes[-1])
-print(f"Sampling strike range of {strike_range}")
 
-open_interests = app.open_interests(contracts)
-greeks = app.greeks(contracts, allow_cached=True)
+def collectOptionsData():
+    # Collect expirations
+    expirations = app.option_expirations(SYMBOL)
+    monthly_expirations = expirations[SYMBOL]
+    weekly_expirations = [exp for exp in expirations[f"{SYMBOL}W"] if exp not in monthly_expirations]
+    sample_expirations = (
+        weekly_expirations[: round(len(weekly_expirations) / 2)] + monthly_expirations[: round(len(monthly_expirations) / 2)]
+    )
+    # sample_expirations = [weekly_expirations[0], monthly_expirations[1]]  # For testing purposes only
+    sample_expirations.sort(key=lambda exp: datetime.strptime(exp, "%Y%m%d"))
+    print("Sampling expirations:", sample_expirations)
+
+    # Collect options contracts
+    contracts: list[ibkr.Contract] = app.option_contracts(SYMBOL, sample_expirations)
+
+    # Collect open interests and IVs (greeks)
+    n_downside_strikes = 300
+    n_upside_strikes = 100
+    # n_downside_strikes = n_upside_strikes = 10  # For testing purposes only
+    contracts = list(filter(lambda c: c.tradingClass in [SYMBOL, f"{SYMBOL}W"], contracts))
+    strikes = sorted(list(set([c.strike for c in contracts])))
+    strikes = (
+        list(filter(lambda strike: strike < spot_price, strikes))[-n_downside_strikes:]
+        + list(filter(lambda strike: strike > spot_price, strikes))[:n_upside_strikes]
+    )
+    contracts = [contract for contract in contracts if contract.strike in strikes]
+    strike_range = (strikes[0], strikes[-1])
+    print(f"Sampling strike range of {strike_range}")
+
+    open_interests = app.open_interests(contracts)
+    if sum(open_interests) == 0:
+        raise Exception("All fetched open interests were 0. Try again later (IBKR issue) or increase option sample size.")
+
+    contracts = [contract for i, contract in enumerate(contracts) if open_interests[i] >= OI_CUTOFF]
+    open_interests = [oi for oi in open_interests if oi >= OI_CUTOFF]
+    greeks = app.greeks(contracts, allow_cached=True)
+
+    # Compile data into a dataframe
+    data = {
+        "Expiry": [],
+        "Timestamp": [],
+        "Strike": [],
+        "Right": [],
+        "Underlying Price": [],
+        "IV": [],
+        "Gamma": [],
+        "Open Interest": [],
+    }
+    for contract, oi, greek in zip(contracts, open_interests, greeks):
+        data["Expiry"].append(contract.lastTradeDateOrContractMonth)
+        data["Timestamp"].append(greek["timestamp"] if "timestamp" in greek else datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        data["Strike"].append(contract.strike)
+        data["Right"].append(contract.right)
+        data["Underlying Price"].append(greek["underlying_price"] if "underlying_price" in greek else "NaN")
+        data["Open Interest"].append(oi)
+        data["IV"].append(greek["iv"] if "iv" in greek else "NaN")
+        data["Gamma"].append(greek["gamma"] if "iv" in greek else "NaN")
+    data_df = pd.DataFrame(data)
+    data_df["Underlying Price"] = data_df["Underlying Price"].round(2)
+    os.makedirs("data", exist_ok=True)
+    # Cache data for debugging purposes; analyze crashes by rerunning with data that causes them
+    data_df.to_csv("data/gamma_flip_line_cache.csv", index=False)
+
+
+collectOptionsData()  # Comment this out to use cached data
 app.disconnect()
 
-# Compile data into a dataframe
-data = {
-    "Expiry": [],
-    "Strike": [],
-    "Right": [],
-    "IV": [],
-    "Gamma": [],
-    "Open Interest": [],
-}
-for contract, oi, greek in zip(contracts, open_interests, greeks):
-    data["Expiry"].append(contract.lastTradeDateOrContractMonth)
-    data["Strike"].append(contract.strike)
-    data["Right"].append(contract.right)
-    data["Open Interest"].append(oi)
-    data["IV"].append(greek["iv"] if "iv" in greek else "NaN")
-    data["Gamma"].append(greek["gamma"] if "iv" in greek else "NaN")
-data_df = pd.DataFrame(data)
-os.makedirs("data", exist_ok=True)
-data_df.to_csv("data/gamma_flip_line_cache.csv", index=False)  # For debugging purposes, reuse data that causes crashes
-
 # Prep data
-# data_df = pd.read_csv("data/gamma_flip_line_cache.csv")
-data_df["IV"] = data_df["IV"] * 100
-data_df["Expiry"] = pd.to_datetime(data_df["Expiry"], format="%Y%m%d") + pd.Timedelta(hours=16)
-data_df["DTE"] = (data_df["Expiry"] - dt).dt.total_seconds() / (60 * 60 * 24)
+data_df = pd.read_csv("data/gamma_flip_line_cache.csv")
+strike_range = (data_df["Strike"].min(), data_df["Strike"].max())
+sample_expirations = data_df["Expiry"].astype(str).unique()
+data_df["IV"] = data_df["IV"]
+data_df["Expiry Date"] = pd.to_datetime(data_df["Expiry"], format="%Y%m%d") + pd.Timedelta(hours=16)
+data_df["Timestamp"] = pd.to_datetime(data_df["Timestamp"])
+data_df["DTE"] = (data_df["Expiry Date"] - data_df["Timestamp"]).dt.total_seconds() / (60 * 60 * 24)
+oi_map = {"C": 1.0, "P": 1.0}  # Dealer long % of call OI and short % of put OI
 
 
-def net_gamma(price, data_df, risk_free_rate):
-    """Calculate net gamma using Black-Scholes across all options (rows) in given dataframe for given underlying price."""
+def net_gamma(data_df, risk_free_rate, underlying_price=None):
+    """
+    Calculate net gamma using Black-Scholes across all options (rows) in given dataframe for given underlying price.
+    If underlying price is not given, uses underlying prices from dataframe instead.
+    """
 
     def model_gamma(row):
         try:
-            bs = mibian.BS([price, row["Strike"], risk_free_rate, row["DTE"]], volatility=row["IV"])
+            return mibian.fast_BS_gamma(
+                row["Underlying Price"] if underlying_price is None else underlying_price,
+                row["Strike"],
+                risk_free_rate,
+                row["DTE"],
+                row["IV"],
+            )
+            # return mibian.BS(
+            #     [
+            #         row["Underlying Price"] if underlying_price is None else underlying_price,
+            #         row["Strike"],
+            #         risk_free_rate * 100,
+            #         row["DTE"],
+            #     ],
+            #     volatility=row["IV"] * 100,
+            # )._gamma()
         except Exception as e:
             print(row)
             raise e
-        return bs._gamma()
 
     data_df["Model Gamma"] = data_df.apply(model_gamma, axis=1)
-    data_df["Gamma Contribution"] = (
-        data_df["Model Gamma"] * data_df["Open Interest"] * ((data_df["Right"] == "C").astype(int) * 2 - 1)
-    )
-    return data_df["Gamma Contribution"].sum() * 100
+    return (
+        data_df["Model Gamma"] * data_df["Open Interest"] * ((data_df["Right"] == "C").astype(int) * 2 - 1) * data_df["Right"].map(oi_map)
+    ).sum() * 100
 
 
 def newton_method(fn, x1, y_threshhold, d=1e-6):
@@ -105,6 +140,11 @@ def newton_method(fn, x1, y_threshhold, d=1e-6):
     inst_run = 2 * d
     m = inst_rise / inst_run
     b = fn(x1) - m * x1
+
+    # Should be extremely unlikely to occur
+    if m == 0:
+        raise Exception("Newton method failed to converge. Tangent slope is zero.")
+
     zero = -b / m
 
     if abs(fn(zero)) < y_threshhold:
@@ -113,11 +153,24 @@ def newton_method(fn, x1, y_threshhold, d=1e-6):
         return newton_method(fn, zero, y_threshhold)
 
 
-# Calculate gamma flip line
+# Fetch risk-free rate
 risk_free_rate = web_apis.risk_free_rate()
+
+# Test model accuracy
+model_net_gamma = net_gamma(data_df.copy(), risk_free_rate)
+actual_net_gamma = (
+    data_df["Gamma"] * data_df["Open Interest"] * ((data_df["Right"] == "C").astype(int) * 2 - 1) * data_df["Right"].map(oi_map)
+).sum() * 100
+print(f"Model accuracy test: model net gamma of {round(model_net_gamma, 2)} versus actual net gamma of {round(actual_net_gamma, 2)}")
+
+# Slim dataframe for better performance
+date = data_df.loc[0, "Timestamp"].strftime("%b %d, %Y")
+data_df = data_df[["Strike", "Right", "Underlying Price", "IV", "Open Interest", "DTE"]]
+
+# Calculate gamma flip line
 print("Calculating gamma flip line...")
 start_time = time.time()
-gamma_flip_price = newton_method(lambda p: net_gamma(p, data_df, risk_free_rate), spot_price, 10)
+gamma_flip_price = newton_method(lambda p: net_gamma(data_df, risk_free_rate, p), spot_price, 10)
 end_time = time.time()
 exec_time = end_time - start_time
 print(f"Gamma Flip Price of {gamma_flip_price:.2f} calculated in {exec_time:.2f} seconds")
@@ -125,14 +178,10 @@ print(f"Gamma Flip Price of {gamma_flip_price:.2f} calculated in {exec_time:.2f}
 # Prep data for plotting
 x_lim = (int(min(gamma_flip_price, spot_price)) - 500, int(max(gamma_flip_price, spot_price)) + 500)
 x_mid = int((x_lim[0] + x_lim[1]) / 2)
-xs = (
-    list(range(x_lim[0], x_mid - 200, 50))
-    + list(range(x_mid - 200, x_mid + 200, 10))
-    + list(range(x_mid + 200, x_lim[1], 50))
-)
+xs = list(range(x_lim[0], x_mid - 200, 50)) + list(range(x_mid - 200, x_mid + 200, 10)) + list(range(x_mid + 200, x_lim[1], 50))
 print("Computing curve...")
 start_time = time.time()
-ys = [net_gamma(x, data_df, risk_free_rate) for x in xs]
+ys = [net_gamma(data_df, risk_free_rate, x) for x in xs]
 end_time = time.time()
 exec_time = end_time - start_time
 print(f"Curve computed in {exec_time:.2f} seconds")
@@ -141,8 +190,19 @@ total_runtime_end = time.time()
 total_runtime = total_runtime_end - total_runtime_start
 print(f"Total runtime of {total_runtime:.2f} seconds")
 
+# Calculate individual curves for each expiration to compare their gamma contributions
+# colors = ["blue", "red", "green", "orange", "pink", "purple"]
+# print("Computing individual curves for each expiration...")
+# start_time = time.time()
+# exp_ys = {
+#     exp: [net_gamma(x, data_df[data_df["Expiry"].astype(str) == exp].copy(), risk_free_rate) for x in xs] for exp in sample_expirations
+# }
+# end_time = time.time()
+# exec_time = end_time - start_time
+# print(f"Individual curves computed in {exec_time:.2f} seconds")
+
 # Create plot
-title = f"{SYMBOL} Gamma Exposure (GEX) for {dt.strftime('%b %d, %Y')}"
+title = f"{SYMBOL} Gamma Exposure (GEX) for {date}"
 fig = plt.figure(figsize=(12, 6), facecolor="beige")
 fig.canvas.manager.set_window_title(title)
 gs = GridSpec(2, 1, height_ratios=[59, 1])
@@ -153,6 +213,10 @@ ax1.set_xlabel("Underlying Price", labelpad=20)
 ax1.grid(True, which="major", linestyle="--", alpha=0.7)
 ax1.grid(True, which="minor", linestyle=":", alpha=0.4)
 ax1.minorticks_on()
+
+# Plot curves for individual expirations
+# for i, exp in enumerate(sample_expirations):
+#     ax1.plot(xs, exp_ys[exp], linestyle="-", color=colors[i], label=exp)
 
 # Plot lines
 ax1.axhline(y=0, color="black", linewidth=1, linestyle="--")
@@ -180,7 +244,10 @@ for tick, color in zip(ax2.xaxis.get_major_ticks(), [tick[1] for tick in special
     # tick.tick1line.set_markeredgewidth(1)
 
 # Sampled expirations
-fmt_expirations = ", ".join(f"{datetime.strptime(exp, '%Y%m%d').strftime('%b %d %Y')}" for exp in sample_expirations)
+fmt_expirations = "".join(
+    datetime.strptime(exp, "%Y%m%d").strftime("%b %d %Y") + (",\n" if (i + 1) % 6 == 0 else ", ")
+    for i, exp in enumerate(sample_expirations)
+)
 ax1.text(
     0.99,
     0.02,

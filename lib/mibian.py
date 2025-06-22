@@ -140,9 +140,9 @@ class GK:
         if self.strikePrice == 0:
             raise ZeroDivisionError("The strike price cannot be zero")
         else:
-            call = e ** (-self.foreignRate * self.daysToExpiration) * self.underlyingPrice * norm.cdf(
-                self._d1_
-            ) - e ** (-self.domesticRate * self.daysToExpiration) * self.strikePrice * norm.cdf(self._d2_)
+            call = e ** (-self.foreignRate * self.daysToExpiration) * self.underlyingPrice * norm.cdf(self._d1_) - e ** (
+                -self.domesticRate * self.daysToExpiration
+            ) * self.strikePrice * norm.cdf(self._d2_)
             put = e ** (-self.domesticRate * self.daysToExpiration) * self.strikePrice * norm.cdf(-self._d2_) - e ** (
                 -self.foreignRate * self.daysToExpiration
             ) * self.underlyingPrice * norm.cdf(-self._d1_)
@@ -182,10 +182,7 @@ class GK:
             raise ZeroDivisionError("The strike price cannot be zero")
         else:
             return (
-                self.underlyingPrice
-                * e ** -(self.foreignRate * self.daysToExpiration)
-                * norm.pdf(self._d1_)
-                * self.daysToExpiration**0.5
+                self.underlyingPrice * e ** -(self.foreignRate * self.daysToExpiration) * norm.pdf(self._d1_) * self.daysToExpiration**0.5
             )
 
     def _theta(self):
@@ -205,45 +202,19 @@ class GK:
 
     def _rhod(self):
         """Returns the option domestic rho: [Call rho, Put rho]"""
-        call = (
-            self.strikePrice
-            * self.daysToExpiration
-            * e ** (-self.domesticRate * self.daysToExpiration)
-            * norm.cdf(self._d2_)
-            / 100
-        )
-        put = (
-            -self.strikePrice
-            * self.daysToExpiration
-            * e ** (-self.domesticRate * self.daysToExpiration)
-            * norm.cdf(-self._d2_)
-            / 100
-        )
+        call = self.strikePrice * self.daysToExpiration * e ** (-self.domesticRate * self.daysToExpiration) * norm.cdf(self._d2_) / 100
+        put = -self.strikePrice * self.daysToExpiration * e ** (-self.domesticRate * self.daysToExpiration) * norm.cdf(-self._d2_) / 100
         return [call, put]
 
     def _rhof(self):
         """Returns the option foreign rho: [Call rho, Put rho]"""
-        call = (
-            -self.underlyingPrice
-            * self.daysToExpiration
-            * e ** (-self.foreignRate * self.daysToExpiration)
-            * norm.cdf(self._d1_)
-            / 100
-        )
-        put = (
-            self.underlyingPrice
-            * self.daysToExpiration
-            * e ** (-self.foreignRate * self.daysToExpiration)
-            * norm.cdf(-self._d1_)
-            / 100
-        )
+        call = -self.underlyingPrice * self.daysToExpiration * e ** (-self.foreignRate * self.daysToExpiration) * norm.cdf(self._d1_) / 100
+        put = self.underlyingPrice * self.daysToExpiration * e ** (-self.foreignRate * self.daysToExpiration) * norm.cdf(-self._d1_) / 100
         return [call, put]
 
     def _gamma(self):
         """Returns the option gamma"""
-        return (norm.pdf(self._d1_) * e ** -(self.foreignRate * self.daysToExpiration)) / (
-            self.underlyingPrice * self._a_
-        )
+        return (norm.pdf(self._d1_) * e ** -(self.foreignRate * self.daysToExpiration)) / (self.underlyingPrice * self._a_)
 
     def _parity(self):
         """Returns the put-call parity"""
@@ -253,6 +224,14 @@ class GK:
             - (self.underlyingPrice / ((1 + self.foreignRate) ** self.daysToExpiration))
             + (self.strikePrice / ((1 + self.domesticRate) ** self.daysToExpiration))
         )
+
+
+def fast_BS_gamma(underlying_price, strike, r, dte, iv):
+    """$, $, %, days, decimal"""
+    dte = dte / 365
+    a = iv * dte**0.5
+    d1 = (log(underlying_price / strike) + (r + (iv**2) / 2) * dte) / a
+    return norm.pdf(d1) / (underlying_price * a)
 
 
 class BS:
@@ -316,8 +295,7 @@ class BS:
 
             self._a_ = self.volatility * self.daysToExpiration**0.5
             self._d1_ = (
-                log(self.underlyingPrice / self.strikePrice)
-                + (self.interestRate + (self.volatility**2) / 2) * self.daysToExpiration
+                log(self.underlyingPrice / self.strikePrice) + (self.interestRate + (self.volatility**2) / 2) * self.daysToExpiration
             ) / self._a_
             self._d2_ = self._d1_ - self._a_
         if callPrice:
@@ -406,10 +384,7 @@ class BS:
     def _parity(self):
         """Put-Call Parity"""
         return (
-            self.callPrice
-            - self.putPrice
-            - self.underlyingPrice
-            + (self.strikePrice / ((1 + self.interestRate) ** self.daysToExpiration))
+            self.callPrice - self.putPrice - self.underlyingPrice + (self.strikePrice / ((1 + self.interestRate) ** self.daysToExpiration))
         )
 
 
@@ -585,16 +560,11 @@ class Me:
 
     def _gamma(self):
         """Returns the option gamma"""
-        return (
-            e ** (-self.dividendYield * self.daysToExpiration) * norm.pdf(self._d1_) / (self.underlyingPrice * self._a_)
-        )
+        return e ** (-self.dividendYield * self.daysToExpiration) * norm.pdf(self._d1_) / (self.underlyingPrice * self._a_)
 
     # Verify
     def _parity(self):
         """Put-Call Parity"""
         return (
-            self.callPrice
-            - self.putPrice
-            - self.underlyingPrice
-            + (self.strikePrice / ((1 + self.interestRate) ** self.daysToExpiration))
+            self.callPrice - self.putPrice - self.underlyingPrice + (self.strikePrice / ((1 + self.interestRate) ** self.daysToExpiration))
         )
