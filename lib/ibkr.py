@@ -1,6 +1,7 @@
+import asyncio
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
-from ibapi.contract import Contract
+from ibapi.contract import Contract, ContractDetails
 
 from typing import List
 import threading
@@ -22,6 +23,14 @@ class App(EWrapper, EClient):
         DELAYED = 3
         DELAYED_FROZEN = 4
 
+    # Manage multiple clients
+    clients: list["App"] = []
+    stop_termination_thread = threading.Event()
+    stop_termination_thread.set()
+
+    # Exit on Ctrl+C
+    signal.signal(signal.SIGINT, lambda sig, frame: (print("Terminating gracefully..."), exit()))
+
     def __init__(self):
         EClient.__init__(self, self)
         self._next_req_id = 1
@@ -36,7 +45,7 @@ class App(EWrapper, EClient):
         self.ticks = {}
         self.tick_sizes = {27: {}, 28: {}}
         self.tick_prices = {}
-        self.contract_details = {}
+        self.contract_details: dict[int, ContractDetails] = {}
         self.sec_def_opt_params = {}
         self.historical_ticks = {}
         self.historical_data = {}
@@ -53,36 +62,45 @@ class App(EWrapper, EClient):
         try:
             super().run()
         except Exception:
-            print("An error occurred in the message loop:")
-            print(traceback.format_exc())
+            self.print("An error occurred in the message loop:")
+            self.print(traceback.format_exc())
 
     def connect(self, host=DEFAULT_HOST, port=DEFAULT_PORT, client_id=DEFUALT_CLIENT_ID):
+        if client_id in [client.clientId for client in App.clients]:
+            self.print("ERROR: Given client ID already exists.")
+            return
+
         # Connect and run
         super().connect(host, port, client_id)
+        App.clients.append(self)
         threading.Thread(target=self.run, daemon=True).start()
 
-        # Terminate gracefully
+        # Terminate gracefully by terminating daemons when main thread exits
         def terminate():
             main_thread = threading.main_thread()
-            self.stop_termination_thread = threading.Event()
             while main_thread.is_alive():
                 time.sleep(1)
-                if self.stop_termination_thread.is_set():
+                if App.stop_termination_thread.is_set():
                     return
-            self.disconnect()
+            for client in App.clients:
+                client.disconnect()  # Terminates threads for EReader and run loop
 
-        threading.Thread(target=terminate, daemon=True).start()
-        signal.signal(signal.SIGINT, self.kill)
+        if App.stop_termination_thread.is_set():
+            App.stop_termination_thread.clear()
+            threading.Thread(target=terminate, daemon=True).start()
 
     def disconnect(self):
         super().disconnect()
 
-        if hasattr(self, "stop_termination_thread"):
-            self.stop_termination_thread.set()
+        # Terminate termination thread if all clients are disconnected
+        if all(not client.isConnected() for client in App.clients):
+            App.stop_termination_thread.set()
 
-    def kill(self, sig, frame):
-        """Triggered when Ctrl+C is pressed. Terminates execution."""
-        exit(0)
+    def print(self, *args):
+        if len(App.clients) > 1:
+            print(f"[Client-{self.clientId}]", *args)
+        else:
+            print(*args)
 
     def next_req_id(self):
         self._next_req_id += 1
@@ -108,8 +126,14 @@ class App(EWrapper, EClient):
 
     def wait_for_end_flag(self):
         while not self.data_end_flag:
-            print("Waiting for end flag...")
+            self.print("Waiting for end flag...")
             time.sleep(1)
+        self.data_end_flag = False
+
+    async def async_wait_for_end_flag(self):
+        while not self.data_end_flag:
+            self.print("Waiting for end flag...")
+            await asyncio.sleep(1)
         self.data_end_flag = False
 
     def make_contract(self, symbol):
@@ -152,8 +176,8 @@ class App(EWrapper, EClient):
             underlying_price = tick[9]
             timestamp = tick[10]
         except Exception:
-            print(f"Error trying to parse tick: {tick}")
-            print(traceback.format_exc())
+            self.print(f"Error trying to parse tick: {tick}")
+            self.print(traceback.format_exc())
             return None
 
         return {
@@ -189,12 +213,12 @@ class App(EWrapper, EClient):
             self.reqMktData(req_id, contract, "", True)
 
         while len(self.live_feeds) > 0:
-            print("Waiting to receive greeks...")
+            self.print("Waiting to receive greeks...")
             time.sleep(1)
 
         end_time = time.time()
         exec_time = end_time - start_time
-        print(f"Received {len(req_ids)} greeks in {exec_time:.2f} seconds")
+        self.print(f"Received {len(req_ids)} greeks in {exec_time:.2f} seconds")
 
         for req_id in req_ids:
             for i, greek in enumerate(greeks):
@@ -204,24 +228,24 @@ class App(EWrapper, EClient):
 
         return greeks
 
-    def open_interests(self, contracts: List[Contract], retry_depth=0):
+    async def open_interests(self, contracts: List[Contract], retry_depth=0):
         """Returns OIs correspond to given contracts of same index."""
         open_interests = []
         start_time = time.time()
         self.reqMarketDataType(self.MarketDataTypes.LIVE)
         req_ids = [self.next_req_id() for contract in contracts]
 
-        print(f"Requesting open interests for {len(contracts)} contracts")
+        self.print(f"Requesting open interests for {len(contracts)} contracts")
         for contract, req_id in zip(contracts, req_ids):
             self.reqMktData(req_id, contract, "101", True)
 
         while len(self.live_feeds) > 0:
-            print("Waiting to receive open interests...")
-            time.sleep(1)
+            self.print("Waiting to receive open interests...")
+            await asyncio.sleep(1)
 
         end_time = time.time()
         exec_time = end_time - start_time
-        print(f"Received {len(req_ids)} open interests in {exec_time:.2f} seconds")
+        self.print(f"Received {len(req_ids)} open interests in {exec_time:.2f} seconds")
 
         for contract, req_id in zip(contracts, req_ids):
             right = contract.right
@@ -235,9 +259,9 @@ class App(EWrapper, EClient):
 
         # Retry indefinitely until all open interests are received
         if None in open_interests and retry_depth < self.max_retry_depth:
-            print(f"Retrying {open_interests.count(None)} missing open interests")
+            self.print(f"Retrying {open_interests.count(None)} missing open interests")
             retry_contracts = [contract for contract, oi in zip(contracts, open_interests) if oi is None]
-            retry_open_interests = self.open_interests(retry_contracts, retry_depth + 1)
+            retry_open_interests = await self.open_interests(retry_contracts, retry_depth + 1)
 
             for retry_oi in retry_open_interests:
                 for i in range(len(open_interests)):
@@ -247,8 +271,8 @@ class App(EWrapper, EClient):
 
         return open_interests
 
-    def option_contracts(self, symbol: str, expirations: List[str], strike="", right=""):
-        req_ids = []
+    async def option_contracts(self, symbol: str, expirations: List[str], strike="", right=""):
+        req_ids: list[int] = []
 
         for expiry in expirations:
             req_id = self.next_req_id()
@@ -258,30 +282,30 @@ class App(EWrapper, EClient):
             # Send request and measure time
             start_time = time.time()
             self.reqContractDetails(req_id, contract)
-            self.wait_for_end_flag()
+            await self.async_wait_for_end_flag()
             end_time = time.time()
             exec_time = end_time - start_time
-            print(f"Done collecting options for expiration {expiry} in {exec_time:.2f} seconds")
-            print(f"Done {len(req_ids)} out of {len(expirations)} expirations")
+            self.print(f"Done collecting options for expiration {expiry} in {exec_time:.2f} seconds")
+            self.print(f"Done {len(req_ids)} out of {len(expirations)} expirations")
 
             # Skip waiting if done all requests
             if len(req_ids) == len(expirations):
                 break
 
             # Detect and counteract throttling
-            print("Waiting to send next request...")
-            if exec_time > 60:
-                time.sleep(300)
-            elif exec_time > 30:
-                time.sleep(60)
+            self.print("Waiting to send next request...")
+            if exec_time > 30:
+                await asyncio.sleep(48)
             elif exec_time > 20:
-                time.sleep(40)
+                await asyncio.sleep(24)
+            elif exec_time > 10:
+                await asyncio.sleep(12)
             elif exec_time > 5:
-                time.sleep(20)
+                await asyncio.sleep(6)
             else:
-                time.sleep(5)
+                await asyncio.sleep(3)
 
-        contract_details = sum([self.contract_details[req_id] for req_id in req_ids], [])
+        contract_details: list[ContractDetails] = sum([self.contract_details[req_id] for req_id in req_ids], [])
         contracts = [cd.contract for cd in contract_details]
         return contracts
 
@@ -291,18 +315,30 @@ class App(EWrapper, EClient):
 
         # Execute request and measure time
         start_time = time.time()
-        print(f"Requesting option expirations for {symbol}")
+        self.print(f"Requesting option expirations for {symbol}")
         self.reqSecDefOptParams(req_id, symbol, con_id)
         self.wait_for_end_flag()
         end_time = time.time()
         exec_time = end_time - start_time
 
-        expirations = {
+        today = datetime.now()
+        expirations: dict[str, list[str]] = {
             params[2]: sorted(list(params[4]), key=lambda expiry: datetime.strptime(expiry, "%Y%m%d"))
             for params in self.sec_def_opt_params[req_id]
             if params[0] == "SMART"
         }
-        print(f"Received all option expirations for {symbol} in {exec_time:.2f} seconds")
+        # If market closed, remove today's expiration b/c those options are expired
+        if today.hour >= 16:
+            expirations = {
+                tradingClass: [
+                    dt.strftime("%Y%m%d")
+                    for dt in [datetime.strptime(e, "%Y%m%d") for e in exps]
+                    if not (dt.day == today.day and dt.month == today.month and dt.year == today.year)
+                ]
+                for tradingClass, exps in expirations.items()
+            }
+
+        self.print(f"Received all option expirations for {symbol} in {exec_time:.2f} seconds")
         return expirations
 
     def get_historical_ticks(self, contract, what_to_show, days):
@@ -317,12 +353,12 @@ class App(EWrapper, EClient):
         while len(all_ticks) == 0 or start < self.timestamp_to_datetime(all_ticks[0].time):
             req_id = self.next_req_id()
             start_time = time.time()
-            print(f"Requesting {what_to_show} ticks until {end_str}")
+            self.print(f"Requesting {what_to_show} ticks until {end_str}")
             self.reqHistoricalTicks(req_id, contract, "", end_str, 1000, what_to_show, 1, True, [])
             self.wait_for_req_id(req_id, poll_time=0.2)
             end_time = time.time()
             exec_time = end_time - start_time
-            print(f"Received {what_to_show} ticks in {exec_time:.2f} seconds")
+            self.print(f"Received {what_to_show} ticks in {exec_time:.2f} seconds")
 
             ticks = self.data[req_id]
             end = self.timestamp_to_datetime(ticks[0].time)
@@ -343,14 +379,14 @@ class App(EWrapper, EClient):
                 sleep = 2
             else:
                 sleep = 0.3
-            print(f"Sleeping before next request (anti-throttle: {sleep}s)...")
+            self.print(f"Sleeping before next request (anti-throttle: {sleep}s)...")
             time.sleep(sleep)
 
         overall_end_time = time.time()
         overall_exec_time = overall_end_time - overall_start_time
         start_str = start.strftime("%Y%m%d %H:%M:%S US/Eastern")
         all_ticks = [tick for tick in all_ticks if self.timestamp_to_datetime(tick.time) >= start]
-        print(f"Received all {len(all_ticks)} {what_to_show} ticks from {start_str} in {overall_exec_time:.2f} seconds")
+        self.print(f"Received all {len(all_ticks)} {what_to_show} ticks from {start_str} in {overall_exec_time:.2f} seconds")
 
         return all_ticks
 
@@ -372,7 +408,7 @@ class App(EWrapper, EClient):
         for timestamps in chunks:
             req_ids = []
             start_time = time.time()
-            print(f"Requesting ticks for chunk: {timestamps}")
+            self.print(f"Requesting ticks for chunk: {timestamps}")
 
             # Request ticks concurrently
             for timestamp in timestamps:
@@ -384,18 +420,18 @@ class App(EWrapper, EClient):
 
             # Wait for chunk
             while not all(req_id in self.data for req_id in req_ids):
-                print("Waiting for chunk to complete...")
+                self.print("Waiting for chunk to complete...")
                 time.sleep(1)
 
             # Measure time
             end_time = time.time()
             exec_time = end_time - start_time
-            print(f"Received bid-ask chunk ticks in {exec_time:.2f} seconds")
+            self.print(f"Received bid-ask chunk ticks in {exec_time:.2f} seconds")
 
             # Parse received chunk
             for timestamp, req_id in zip(timestamps, req_ids):
                 bid_ask_ticks[timestamp] = self.data[req_id]
-            print(f"Done {len(bid_ask_ticks)} out of {len(unique_trade_times)} ticks")
+            self.print(f"Done {len(bid_ask_ticks)} out of {len(unique_trade_times)} ticks")
 
             # Skip throttle control if done
             if len(bid_ask_ticks) == len(unique_trade_times):
@@ -415,16 +451,16 @@ class App(EWrapper, EClient):
                 sleep = 2
             else:
                 sleep = 1
-            print(f"Sleeping before next request (anti-throttle: {sleep}s)...")
+            self.print(f"Sleeping before next request (anti-throttle: {sleep}s)...")
             time.sleep(sleep)
 
         # Confirm all timestamps retreived
-        print(f"Confirm all timestamps received: {all(timestamp in bid_ask_ticks for timestamp in unique_trade_times)}")
+        self.print(f"Confirm all timestamps received: {all(timestamp in bid_ask_ticks for timestamp in unique_trade_times)}")
 
         # Measure overall time
         overall_end_time = time.time()
         overall_exec_time = overall_end_time - overall_start_time
-        print(f"All bid-ask ticks received in {overall_exec_time:.2f} seconds")
+        self.print(f"All bid-ask ticks received in {overall_exec_time:.2f} seconds")
 
         return bid_ask_ticks
 
@@ -436,12 +472,19 @@ class App(EWrapper, EClient):
         self.reqHistoricalData(req_id, contract, end, "60 S", "1 min", "TRADES", use_RTH=use_RTH)
 
         while req_id not in self.historical_data:
-            print("Waiting for spot price...")
+            self.print("Waiting for spot price...")
             time.sleep(1)
 
-        spot_price = self.historical_data[req_id][0].close
-        dt = datetime.strptime(self.historical_data[req_id][0].date, "%Y%m%d %H:%M:%S US/Central")
-        return spot_price, dt + timedelta(hours=1, minutes=1)  # Convert to US/Eastern
+        spot_price: float = self.historical_data[req_id][0].close
+        self.print(f"Fetched spot price of {spot_price:.2f}")
+
+        dt_str = self.historical_data[req_id][0].date
+        if "US/Central" in dt_str:
+            dt = datetime.strptime(self.historical_data[req_id][0].date, "%Y%m%d %H:%M:%S US/Central")
+            dt = dt + timedelta(hours=1, minutes=1)  # Convert to US/Eastern
+        else:
+            dt = datetime.strptime(self.historical_data[req_id][0].date, "%Y%m%d %H:%M:%S US/Eastern")
+        return spot_price, dt
 
     ##
     ## WRAPPER (METHODS RUN IN MESSAGE LOOP THREAD)
@@ -458,12 +501,12 @@ class App(EWrapper, EClient):
 
     def historicalTicksBidAsk(self, reqId, ticks, done):
         # for tick in ticks:
-        #     print(f"{(tick.time, tick.priceBid, tick.priceAsk)}")
+        #     self.print(f"{(tick.time, tick.priceBid, tick.priceAsk)}")
         self.historical_ticks[reqId] = ticks
 
     def historicalTicksLast(self, reqId, ticks, done):
         # for tick in ticks:
-        #     print(f"{(tick.time, tick.price)}")
+        #     self.print(f"{(tick.time, tick.price)}")
         self.historical_ticks[reqId] = ticks
 
     def historicalData(self, reqId, bar):
@@ -515,13 +558,13 @@ class App(EWrapper, EClient):
             self.timeouts.pop(reqId)
 
         if reqId not in self.live_feeds:
-            print(f"WARNING: Tick snapshot end received for {reqId} not in live feeds list. ")
+            self.print(f"WARNING: Tick snapshot end received for {reqId} not in live feeds list. ")
             return
 
         self.live_feeds.remove(reqId)
         self.dequeue_feed_queue()
 
-        print(f"Done req_id {reqId}")
+        self.print(f"Done req_id {reqId}")
 
     ##
     ## CLIENT
@@ -530,7 +573,7 @@ class App(EWrapper, EClient):
     def _wait_until_connected(self):
         # while self.conn is None or not self.conn.isConnected():
         #     time.sleep(0.1)
-        # print(f"Is connected: {self.conn.isConnected()}")
+        # self.print(f"Is connected: {self.conn.isConnected()}")
         pass
 
     def reqContractDetails(self, req_id, contract):
@@ -549,7 +592,7 @@ class App(EWrapper, EClient):
             timeouts = self.timeouts.copy()
             for req_id, timeout in timeouts.items():
                 if time.time() > timeout:
-                    print(f"Timing out req_id {req_id}")
+                    self.print(f"Timing out req_id {req_id}")
                     self.timeout_thread.clear()
                     self.cancelMktData(req_id)
                     self.timeout_thread.wait()
@@ -580,8 +623,10 @@ class App(EWrapper, EClient):
         else:
             self.feed_queue.append(lambda: self.reqMktData(req_id, contract, tick_list, snapshot))
 
-        if not any([self.timeout_snapshots.__name__ in thread.getName() for thread in threading.enumerate()]):
-            threading.Thread(target=self.timeout_snapshots, daemon=True).start()
+        if f"[Client-{self.clientId}] {self.timeout_snapshots.__name__}" not in [thread.name for thread in threading.enumerate()]:
+            threading.Thread(
+                target=self.timeout_snapshots, daemon=True, name=f"[Client-{self.clientId}] {self.timeout_snapshots.__name__}"
+            ).start()
 
     def dequeue_feed_queue(self):
         if len(self.feed_queue) > 0:
@@ -596,13 +641,13 @@ class App(EWrapper, EClient):
             self.timeouts.pop(req_id)
 
         if req_id not in self.live_feeds:
-            print(f"WARNING: Requested to cancel req_id {req_id} not in live feeds list. ")
+            self.print(f"WARNING: Requested to cancel req_id {req_id} not in live feeds list. ")
             return
 
         self.live_feeds.remove(req_id)
         self.dequeue_feed_queue()
 
-        print(f"Done req_id {req_id}")
+        self.print(f"Done req_id {req_id}")
         self.timeout_thread.set()
 
     def reqSecDefOptParams(self, req_id: int, symbol: str, con_id: int):

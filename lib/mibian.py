@@ -11,6 +11,11 @@ try:
 except ImportError:
     print("Mibian requires scipy to work properly")
 
+try:
+    import cupy as cp
+except ImportError:
+    print("CUDA / CuPy not detected. GPU parallelized methods will not be available.")
+
 # WARNING: All numbers should be floats -> x = 1.0
 
 
@@ -226,12 +231,30 @@ class GK:
         )
 
 
-def fast_BS_gamma(underlying_price, strike, r, dte, iv):
+def CPU_BS_gamma(underlying_price, strike, r, dte, iv):
     """$, $, %, days, decimal"""
     dte = dte / 365
     a = iv * dte**0.5
     d1 = (log(underlying_price / strike) + (r + (iv**2) / 2) * dte) / a
     return norm.pdf(d1) / (underlying_price * a)
+
+
+def GPU_BS_gamma(underlying_price, strike, r, dte, iv):
+    """
+    - underlying_price: CuPy array, underlying prices ($)
+    - strike: CuPy array, strike prices ($)
+    - r: Float, risk-free rate (%)
+    - dte: CuPy array, days to expiration (days)
+    - iv: CuPy array, implied volatilities (decimal)
+
+    Returns:
+    - CuPy array of gammas
+    """
+    dte = dte / 365
+    a = iv * cp.sqrt(dte)
+    d1 = (cp.log(underlying_price / strike) + (r + (iv**2) / 2) * dte) / a
+    norm_pdf = cp.exp(-(d1**2) / 2) / cp.sqrt(2 * cp.pi)
+    return norm_pdf / (underlying_price * a)
 
 
 class BS:
