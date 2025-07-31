@@ -27,7 +27,7 @@ OI_CUTOFF = 100
 total_runtime_start = time.time()
 
 
-async def collectOptionsData():
+async def collect_options_data():
     app = ibkr.App()
     app.connect()
 
@@ -99,7 +99,7 @@ async def collectOptionsData():
     app.disconnect()
 
 
-asyncio.run(collectOptionsData())  # Comment this out to use cached data
+asyncio.run(collect_options_data())  # Comment this out to use cached data
 
 # Prep data
 data_df = pd.read_csv("data/gamma_flip_line_cache.csv")
@@ -193,7 +193,7 @@ actual_net_gamma = (
 print(f"Model accuracy test: model net gamma of {round(model_net_gamma, 2)} versus actual net gamma of {round(actual_net_gamma, 2)}")
 
 # Slim dataframe for better performance
-date = data_df.loc[0, "Timestamp"].strftime("%b %d, %Y")
+dt_str = data_df.loc[data_df.index[-1], "Timestamp"].strftime("%b %d, %Y %H:%M:%S")  # use timestamp of last option collected
 data_df = data_df[["Strike", "Right", "Underlying Price", "IV", "Open Interest", "DTE"]]
 
 # Find flip interval (change of net gamma sign)
@@ -275,7 +275,7 @@ print(f"Total runtime of {total_runtime:.2f} seconds")
 # print(f"Individual curves computed in {exec_time:.2f} seconds")
 
 # Create plot
-title = f"{SYMBOL} Gamma Exposure (GEX) for {date}"
+title = f"{SYMBOL} Gamma Exposure (GEX) - {dt_str}"
 fig = plt.figure(figsize=(12, 6), facecolor="beige")
 fig.canvas.manager.set_window_title(title)
 gs = GridSpec(2, 1, height_ratios=[59, 1])

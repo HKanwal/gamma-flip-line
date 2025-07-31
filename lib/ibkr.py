@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timedelta
 import pytz
 import traceback
+import math
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7496
@@ -35,7 +36,7 @@ class App(EWrapper, EClient):
         EClient.__init__(self, self)
         self._next_req_id = 1
         self.tz = pytz.timezone("US/Eastern")
-        self.indices = ["SPX", "NDX", "DJI"]
+        self.indices = ["SPX", "NDX", "DJI", "VIX", "VIX3M"]
         self.max_retry_depth = 3
 
         # Store data wrapper received by request id
@@ -229,7 +230,7 @@ class App(EWrapper, EClient):
         return greeks
 
     async def open_interests(self, contracts: List[Contract], retry_depth=0):
-        """Returns OIs correspond to given contracts of same index."""
+        """Returned OIs correspond to given contracts of same index."""
         open_interests = []
         start_time = time.time()
         self.reqMarketDataType(self.MarketDataTypes.LIVE)
@@ -257,7 +258,7 @@ class App(EWrapper, EClient):
                 oi = None
             open_interests.append(oi)
 
-        # Retry indefinitely until all open interests are received
+        # Retry until all open interests are received or max retry depth is reached
         if None in open_interests and retry_depth < self.max_retry_depth:
             self.print(f"Retrying {open_interests.count(None)} missing open interests")
             retry_contracts = [contract for contract, oi in zip(contracts, open_interests) if oi is None]
@@ -485,6 +486,21 @@ class App(EWrapper, EClient):
         else:
             dt = datetime.strptime(self.historical_data[req_id][0].date, "%Y%m%d %H:%M:%S US/Eastern")
         return spot_price, dt
+
+    def closes(self, symbol: str, days: int):
+        contract = self.make_contract(symbol)
+        req_id = self.next_req_id()
+        end = datetime.now().strftime("%Y%m%d %H:%M:%S America/New_York")
+        duration = f"{days} D" if days <= 365 else f"{math.ceil(days / 248)} Y"  # 248 is low-end estimate of trading days in year
+
+        self.reqHistoricalData(req_id, contract, end, duration, "1 day", "TRADES", use_RTH=True)
+
+        while req_id not in self.historical_data:
+            self.print(f"Waiting for closes for {symbol}...")
+            time.sleep(1)
+
+        closes = {bar.date: bar.close for bar in self.historical_data[req_id][-days:]}
+        return closes
 
     ##
     ## WRAPPER (METHODS RUN IN MESSAGE LOOP THREAD)
